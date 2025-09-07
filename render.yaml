@@ -3,7 +3,7 @@ services:
     name: vinted-discord-bot
     region: frankfurt
     plan: starter
-    autoDeploy: true
+    runtime: node
     buildCommand: "npm install"
     startCommand: "bash start.sh"
     envVars:
