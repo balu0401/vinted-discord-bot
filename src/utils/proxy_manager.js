@@ -1,159 +1,107 @@
-import { SocksProxyAgent } from 'socks-proxy-agent';
-import Logger from './logger.js';
-import { listProxies, Proxy } from './proxies.js';
-import ConfigurationManager from './config_manager.js';
+// src/utils/proxy_manager.js
 import fs from 'fs';
+import { SocksProxyAgent } from 'socks-proxy-agent';
+import { ProxyAgent as UndiciProxyAgent } from 'undici';
+import Logger from './logger.js';
 
-/**
- * Fontos: ténylegesen hívd meg a konfigurációolvasót.
- * Ajánlott defaultok a config_managerben:
- *  - enabled: false
- *  - use_webshare: false
- */
-const proxy_settings = ConfigurationManager.getProxiesConfig;
+const SECRET_FILE = '/etc/secrets/proxies.txt';
+const LOCAL_FILE  = 'proxies.txt';
 
-
-/**
- * Static class for managing proxy settings and making HTTP requests with SOCKS authentication.
- */
 class ProxyManager {
-  static proxyConfig = null;
-  static proxies = [];
-  static proxiesLoaded = false;
-  static currentProxyIndex = 0;
-  static proxiesOnCooldown = [];
+  static enabled = false;
+  static urls = [];
+  static idx = -1;
+  static cooldown = new Map(); // url -> retryAt(ms)
 
-  /**
-   * Inicializálás. Ha nincs proxy beállítva (vagy hiányzik a kulcs/fájl), proxy nélkül futunk tovább.
-   */
-  static async init(maxRetries = 3, retryDelay = 3000) {
+  static async init() {
+    const want = String(process.env.PROXY_ENABLED || '').toLowerCase() === 'true';
+    if (!want) {
+      Logger.info('[ProxyManager] Disabled (PROXY_ENABLED!=true). Running without proxy.');
+      this.enabled = false;
+      return;
+    }
+
+    let txt = '';
+    if (fs.existsSync(SECRET_FILE)) {
+      txt = fs.readFileSync(SECRET_FILE, 'utf8');
+      Logger.info('[ProxyManager] Loaded proxies from Secret File.');
+    } else if (fs.existsSync(LOCAL_FILE)) {
+      txt = fs.readFileSync(LOCAL_FILE, 'utf8');
+      Logger.info('[ProxyManager] Loaded proxies from local proxies.txt.');
+    } else {
+      Logger.warn('[ProxyManager] proxies.txt not found. Running without proxy.');
+      this.enabled = false;
+      return;
+    }
+
+    const lines = txt.split('\n').map(l => l.trim()).filter(Boolean);
+    this.urls = [];
+
+    for (const line of lines) {
+      if (line.includes('://')) {
+        // támogatjuk a teljes URL formátumot is
+        this.urls.push(line);
+      } else {
+        // ip:port:user:pass  -> default: HTTP
+        const [host, port, user, pass] = line.split(':');
+        if (!host || !port || !user || !pass) continue;
+        const url = `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+        this.urls.push(url);
+      }
+    }
+
+    if (this.urls.length === 0) {
+      Logger.warn('[ProxyManager] proxies list empty. Running without proxy.');
+      this.enabled = false;
+      return;
+    }
+
+    this.enabled = true;
+    this.idx = -1;
+    this.cooldown.clear();
+    Logger.info(`[ProxyManager] Loaded ${this.urls.length} proxies (HTTP/SOCKS hybrid).`);
+  }
+
+  static nextUrl() {
+    if (!this.enabled || this.urls.length === 0) return undefined;
+    const now = Date.now();
+    for (let i = 0; i < this.urls.length; i++) {
+      this.idx = (this.idx + 1) % this.urls.length;
+      const url = this.urls[this.idx];
+      const until = this.cooldown.get(url) || 0;
+      if (until <= now) return url;
+    }
+    return undefined; // mind cooldownon
+  }
+
+  static getAgentOrUndefined() {
+    const url = this.nextUrl();
+    if (!url) return undefined;
     try {
-      // Ha nincs konfiguráció vagy explicit ki van kapcsolva → proxy OFF
-      if (
-        !proxy_settings ||
-        proxy_settings.enabled === false ||
-        (proxy_settings.enabled !== true &&
-          proxy_settings.use_webshare !== true &&
-          !fs.existsSync('proxies.txt'))
-      ) {
-        Logger.info('[ProxyManager] No proxy configured; running without proxy.');
-        this.proxies = [];
-        return;
+      if (url.startsWith('socks')) {
+        return new SocksProxyAgent(url);
       }
-
-      // WEBSHARE mód
-      if (proxy_settings.use_webshare === true) {
-        if (!proxy_settings.webshare_api_key) {
-          Logger.warn('[ProxyManager] Webshare enabled but no API key. Running without proxy.');
-          this.proxies = [];
-          return;
-        }
-
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-          try {
-            this.proxies = await listProxies(proxy_settings.webshare_api_key);
-            Logger.info(`Loaded ${this.proxies.length} proxies from Webshare.`);
-            break;
-          } catch (err) {
-            Logger.error(`Attempt ${attempt + 1} failed to initialize proxies: ${err.message}`);
-            if (attempt === maxRetries - 1) {
-              Logger.warn('[ProxyManager] Giving up on proxy init. Running without proxy.');
-              this.proxies = [];
-            } else {
-              await new Promise((r) => setTimeout(r, retryDelay));
-            }
-          }
-        }
-        return;
-      }
-
-      // FÁJL alapú proxyk
-      if (!fs.existsSync('proxies.txt')) {
-        Logger.info('[ProxyManager] proxies.txt not found. Running without proxy.');
-        this.proxies = [];
-        return;
-      }
-
-      const proxyFile = fs.readFileSync('proxies.txt', 'utf8');
-      const proxyLines = proxyFile
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean);
-
-      for (const line of proxyLines) {
-        const parts = line.split(':');
-        // host:port:user:pass formátum
-        if (parts.length === 4) {
-          const proxy = new Proxy(parts[0], parts[1], parts[2], parts[3]);
-          this.proxies.push(proxy);
-        }
-      }
-
-      Logger.info(`Loaded ${this.proxies.length} proxies from file.`);
-      if (this.proxies.length === 0) {
-        Logger.info('[ProxyManager] No proxies loaded from file. Running without proxy.');
-      }
-    } catch (error) {
-      Logger.warn(`[ProxyManager] Unexpected init error (${error.message}). Running without proxy.`);
-      this.proxies = [];
+      // http/https → Undici ProxyAgent (Node 18+/22 fetch kompatibilis)
+      return new UndiciProxyAgent(url);
+    } catch (e) {
+      Logger.error(`[ProxyManager] Agent create failed: ${e.message}`);
+      return undefined;
     }
   }
 
-  /**
-   * Clears the proxy configuration.
-   */
-  static clearProxy() {
-    this.proxyConfig = null;
+  static coolDown(urlOrMs, ms = 60_000) {
+    const url = typeof urlOrMs === 'string' ? urlOrMs : null;
+    if (!url) return;
+    this.cooldown.set(url, Date.now() + ms);
   }
 
-  /**
-   * Retrieves the next proxy (round-robin). Ha nincs proxy, undefined-del tér vissza – ez NEM hiba.
-   * @returns {Proxy|undefined}
-   */
-  static getNewProxy() {
-    if (this.proxies.length > 0) {
-      this.currentProxyIndex = (this.currentProxyIndex + 1) % this.proxies.length;
-      const proxy = this.proxies[this.currentProxyIndex];
-      return proxy;
-    }
-    // proxy nélkül futunk – nem hiba
-    if (Logger.debug) Logger.debug('[ProxyManager] No proxies available; direct connection.');
-    return undefined;
-  }
-
-  /**
-   * Get New Proxy Socks Agent
-   * @param {Proxy} proxy - The proxy to get the agent for
-   * @returns {SocksProxyAgent|undefined} - The proxy agent
-   */
-  static getProxyAgent(proxy) {
-    if (!proxy) return undefined;
-    return new SocksProxyAgent(proxy.getProxyString());
-  }
-
-  /**
-   * Remove invalid proxies from the list
-   * @param {Proxy} proxy - The proxy to remove
-   * @returns {void}
-   */
-  static removeProxy(proxy) {
-    this.proxies = this.proxies.filter((p) => p !== proxy);
-  }
-
-  /**
-   * Temporarily remove a proxy, then re-add after cooldown.
-   * @param {Proxy} proxy
-   * @param {number} timeout
-   */
-  static removeTemporarlyInvalidProxy(proxy, timeout = 60_000) {
-    this.proxiesOnCooldown.push(proxy);
-    this.proxies = this.proxies.filter((p) => p !== proxy);
-
-    setTimeout(() => {
-      this.proxies.push(proxy);
-      this.proxiesOnCooldown = this.proxiesOnCooldown.filter((p) => p !== proxy);
-    }, timeout);
+  // fetch opciók kiegészítése proxival (undici/Node fetch-hez)
+  static withProxy(options = {}) {
+    const agent = this.getAgentOrUndefined();
+    if (!agent) return { ...options };
+    return { ...options, dispatcher: agent, agent };
   }
 }
 
 export default ProxyManager;
+
