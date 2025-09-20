@@ -1,54 +1,45 @@
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord.js';
+// src/bot/commands_handler.js
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { REST, Routes } from 'discord.js';
+
 import Logger from '../utils/logger.js';
 import ConfigurationManager from '../utils/config_manager.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// __dirname ESM-ben
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const commands = [];
-const commandFiles = fs.readdirSync(path.join(__dirname, 'commands')).filter(file => file.endsWith('.js'));
+// A repo-ban a config "getterek" property-ként vannak használva
+// (NEM függvényhívás), ezért itt is így olvassuk ki.
+const discordConfig = ConfigurationManager.getDiscordConfig;
+const command_id_channel_id = ConfigurationManager.getDiscordCommandChannelId;
 
-const command_id_channel = ConfigurationManager.getDiscordConfig.command_channel_id;
-
-// Using dynamic imports to load command modules
+// -----------------------------------------------------------------------------
+// Parancsok betöltése (dynamic import) a ./commands mappából
+// -----------------------------------------------------------------------------
 async function loadCommands() {
-    for (const file of commandFiles) {
-        const module = await import(`./commands/${file}`);
-        commands.push(module.data.toJSON());
-    }
-}
+  const commands = [];
+  const commandsDir = path.join(__dirname, 'commands');
 
-export async function registerCommands(client, discordConfig) {
-    await loadCommands();  // Ensure all commands are loaded before registering
-    const rest = new REST({ version: '9' }).setToken(discordConfig.token);
+  if (!fs.existsSync(commandsDir)) {
+    Logger.warn(`[commands_handler] Commands directory not found: ${commandsDir}`);
+    return commands;
+  }
+
+  const files = fs.readdirSync(commandsDir).filter((f) => f.endsWith('.js'));
+
+  for (const file of files) {
     try {
-        Logger.info('Started refreshing application (/) commands.');
-        await rest.put(
-            Routes.applicationCommands(discordConfig.client_id),
-            { body: commands }
-        );
-        Logger.info('Successfully reloaded application (/) commands.');
-    } catch (error) {
-        console.error('Error reloading commands:', error);
-    }
-}
-
-export async function handleCommands(interaction) {
-    if (!interaction.isCommand()) return;
-
-    Logger.info(`Received command: ${interaction.commandName}`);
-
-    const channel = interaction.channel;
-    const isThread = channel.isThread();
-
-    // Check if the command is allowed to be executed in the command channel or in thread channels
-    if (interaction.channelId !== command_id_channel && !isThread) {
-        await interaction.reply({ content: 'This command is not allowed in this channel. Please use <#'+command_id_channel+'> or one of your private channels.', ephemeral: true });
-        return;
-    }
+      const mod = await import(`./commands/${file}`);
+      // A legtöbb djs mintában command.data.toJSON() van.
+      // Ha a repo-ban public_data néven van, arra is támogatás:
+      const data =
+        mod?.data?.toJSON?.() ??
+        mod?.public_data?.t_
 
     try {   
         const module = await import(`./commands/${interaction.commandName}.js`);
