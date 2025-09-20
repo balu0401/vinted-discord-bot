@@ -10,7 +10,8 @@ import fs from 'fs';
  *  - enabled: false
  *  - use_webshare: false
  */
-const proxy_settings = ConfigurationManager.getProxiesConfig();
+const proxy_settings = ConfigurationManager.getProxiesConfig;
+
 
 /**
  * Static class for managing proxy settings and making HTTP requests with SOCKS authentication.
